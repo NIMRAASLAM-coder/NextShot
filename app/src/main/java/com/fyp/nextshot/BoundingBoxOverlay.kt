@@ -1,6 +1,7 @@
 package com.fyp.nextshot
 
 import android.content.Context
+import android.util.Log
 import android.graphics.*
 import android.util.AttributeSet
 import android.view.View
@@ -19,12 +20,16 @@ class BoundingBoxOverlay : View {
     constructor(context: Context, attrs: AttributeSet?) : super(context, attrs)
     constructor(context: Context, attrs: AttributeSet?, defStyleAttr: Int) : super(context, attrs, defStyleAttr)
 
-    private var imageWidth = 0f
-    private var imageHeight = 0f
+    var imageWidth = 0f
+        private set
+    var imageHeight = 0f
+        private set
 
     fun setImageSize(w: Int, h: Int) {
         imageWidth = w.toFloat()
         imageHeight = h.toFloat()
+        Log.d("BBOX_DEBUG", "setImageSize called: ${w}x${h}, view is ${this.width}x${this.height}")
+        invalidate()
     }
 
     private var detections: List<Detection> = emptyList()
@@ -106,17 +111,27 @@ class BoundingBoxOverlay : View {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (detections.isEmpty() || imageWidth == 0f || imageHeight == 0f) return
+
+        Log.d("BBOX_DEBUG", "onDraw: detections=${detections.size}, imageWidth=$imageWidth, imageHeight=$imageHeight, viewW=$width, viewH=$height")
+
+        if (detections.isEmpty() || imageWidth == 0f || imageHeight == 0f) {
+            Log.d("BBOX_DEBUG", "onDraw EARLY RETURN: detections=${detections.size} imgW=$imageWidth imgH=$imageHeight")
+            return
+        }
 
         val scale = min(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
         val offsetX = (width - imageWidth * scale) / 2f
         val offsetY = (height - imageHeight * scale) / 2f
+
+        Log.d("BBOX_DEBUG", "onDraw drawing: scale=$scale, offsetX=$offsetX, offsetY=$offsetY")
 
         for (det in detections) {
             val left   = det.bbox.left   * imageWidth  * scale + offsetX
             val top    = det.bbox.top    * imageHeight * scale + offsetY
             val right  = det.bbox.right  * imageWidth  * scale + offsetX
             val bottom = det.bbox.bottom * imageHeight * scale + offsetY
+
+            Log.d("BBOX_DEBUG", "Drawing rect: left=$left top=$top right=$right bottom=$bottom (bbox=${det.bbox})")
 
             canvas.drawRect(left, top, right, bottom, boxPaint)
 

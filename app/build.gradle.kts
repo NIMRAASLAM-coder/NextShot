@@ -154,4 +154,8 @@ dependencies {
 
     // YouTube Player Library
     implementation("com.pierfrancescosoffritti.androidyoutubeplayer:core:12.1.0")
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
+
+    //Mediapipe
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
 }
