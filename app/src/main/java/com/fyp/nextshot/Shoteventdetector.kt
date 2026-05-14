@@ -4,56 +4,72 @@ import kotlin.math.sqrt
 import android.util.Log
 
 /**
- * ShotEventDetector v4
+ * ShotEventDetector v5
  *
- * Fixes over v3:
+ * Changes over v4:
  *
- *  1. PASSES VELOCITY TO CLASSIFIER — ShotClassifier.classify() now takes
- *     the current wrist velocity so it can return "" for idle frames.
- *     This eliminates the "Cut shown while standing still" bug completely.
+ *  1. BAT ORIENTATION INTEGRATION
+ *     A BatMovementTracker instance lives inside the detector.
+ *     Every call to feed() also calls batTracker.update() and passes the
+ *     resulting BatAngleResult into ShotClassifier.classify() so that bat
+ *     orientation contributes to per-frame labelling.
  *
- *  2. OVERLAY FREEZE on video end — finalizedLabel is NEVER cleared after
- *     a shot is committed. The overlay keeps showing the last real shot
- *     even when the video loops back to frame 0 (idle stance).
- *     Previously reset() was called on re-entry which wiped the label.
+ *  2. SWING-PHASE-AWARE STATE TRANSITIONS
+ *     The state machine now cross-checks BatMovementTracker.swingPhase:
  *
- *  3. PEAK-LABEL selection — label taken from the highest-velocity frame
- *     (impact moment), not the last frame (follow-through/idle).
+ *     • BACKLIFT  phase → suppresses premature SWINGING entry.
+ *       (Wrist can move fast during backlift; we don't want that to start
+ *        a shot window before the downswing begins.)
  *
- *  4. SHORT-VIDEO tuning — MIN_SWING_FRAMES=2, SETTLE_FRAMES=2.
- *     A 2-second video at 200ms = 10 frames; old values (4+3) consumed 70%.
+ *     • DOWNSWING phase → accelerates SWINGING entry even at lower wrist velocity.
+ *       (Bat is definitely on its way to the ball — open the window early.)
  *
- *  5. VELOCITY_PEAK_REQUIRED lowered 0.015 → 0.010 for short clips.
+ *     • IMPACT_ZONE phase → marks the peak-velocity frame as the best label frame.
+ *
+ *     • FOLLOW_THROUGH phase → counts toward SETTLING faster (shot is done).
+ *
+ *  3. DUAL-SIGNAL PEAK SELECTION
+ *     pickBestLabel() now uses both peak wrist-velocity AND the frame(s)
+ *     that coincided with IMPACT_ZONE phase to vote for the label.
+ *
+ *  4. BAT TRACKER RESET
+ *     reset() and clearSwingWindow() also reset the BatMovementTracker so
+ *     stale angle history from a previous video doesn't pollute a new session.
  */
 class ShotEventDetector {
 
     // ── Velocity thresholds ───────────────────────────────────────────────────
-    private val VELOCITY_SWING_START   = 0.006f   // enter SWINGING
-    private val VELOCITY_SWING_HOLD    = 0.004f   // stay in SWINGING from SETTLING
-    private val VELOCITY_SETTLE_ENTER  = 0.003f   // enter SETTLING
-    private val VELOCITY_PEAK_REQUIRED = 0.010f   // reject micro-movements
+    private val VELOCITY_SWING_START      = 0.006f
+    private val VELOCITY_SWING_START_DOWN = 0.004f  // lower threshold during DOWNSWING phase
+    private val VELOCITY_SWING_HOLD       = 0.004f
+    private val VELOCITY_SETTLE_ENTER     = 0.003f
+    private val VELOCITY_PEAK_REQUIRED    = 0.010f
 
     private val SETTLE_FRAMES    = 2
     private val MIN_SWING_FRAMES = 2
     private val CONF_THRESHOLD   = 0.25f
 
+    // ── Bat tracker (one per detector instance) ───────────────────────────────
+    private val batTracker = BatMovementTracker(historySize = 6)
+
     // ── State machine ─────────────────────────────────────────────────────────
     private enum class State { IDLE, SWINGING, SETTLING }
     private var state = State.IDLE
 
-    private val swingLabels     = mutableListOf<String>()
-    private val swingVelocities = mutableListOf<Float>()
+    // Per-swing accumulators
+    private val swingLabels      = mutableListOf<String>()
+    private val swingVelocities  = mutableListOf<Float>()
+    private val swingBatPhases   = mutableListOf<SwingPhase>()  // NEW: parallel bat-phase list
 
-    private var settleCount        = 0
-    private var swingFrameCount    = 0
+    private var settleCount          = 0
+    private var swingFrameCount      = 0
     private var lastWristPos: Pair<Float, Float>? = null
-    private var maxVelocityInSwing = 0f
+    private var maxVelocityInSwing   = 0f
+    private var impactFrameLabel     = ""   // label captured at IMPACT_ZONE phase
 
     /**
-     * The last committed shot label. Intentionally NEVER reset to "" after
-     * a shot is finalized — the UI should keep showing the last real result
-     * rather than reverting to blank (which makes it look like "Cut" flashed
-     * from the idle-frame detection at video start).
+     * The last committed shot label. Never reset to "" after finalization —
+     * overlay keeps the last real shot even when wrist becomes idle.
      */
     var finalizedLabel = ""
         private set
@@ -62,10 +78,6 @@ class ShotEventDetector {
     var shotEventCount = 0
         private set
 
-    /**
-     * Ordered list of every committed shot label for this session.
-     * Use getShotSummary() to get a formatted count map for display.
-     */
     private val shotHistory = mutableListOf<String>()
 
     /** Returns a map of shot label → count, e.g. {"Drive"→3, "Pull"→1}. */
@@ -74,27 +86,26 @@ class ShotEventDetector {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /**
-     * Full reset — call only when starting a brand-new session/video.
-     * Clears finalizedLabel so the previous video's result does not bleed in.
-     */
+    /** Full reset — call when starting a brand-new session or video. */
     fun reset() {
         state = State.IDLE
         swingLabels.clear()
         swingVelocities.clear()
-        settleCount = 0
-        swingFrameCount = 0
-        lastWristPos = null
-        finalizedLabel = ""          // intentional: new session, clean slate
-        maxVelocityInSwing = 0f
-        shotEventCount = 0
+        swingBatPhases.clear()
+        settleCount          = 0
+        swingFrameCount      = 0
+        lastWristPos         = null
+        finalizedLabel       = ""
+        maxVelocityInSwing   = 0f
+        impactFrameLabel     = ""
+        shotEventCount       = 0
         shotHistory.clear()
+        batTracker.reset()
     }
 
     /**
-     * Call after the last frame of a video (or when live session stops).
-     * Forces finalization of any in-progress swing so the label is never lost
-     * in short videos that end before the wrist fully settles.
+     * Force-finalize any in-progress swing.
+     * Call after the last frame of a video or when a live session stops.
      */
     fun flush(): String {
         if ((state == State.SWINGING || state == State.SETTLING)
@@ -112,16 +123,20 @@ class ShotEventDetector {
                             "peak=${"%.4f".format(maxVelocityInSwing)}  labels=$swingLabels")
             }
         }
-        clearSwingWindow()   // clear window state but NOT finalizedLabel
+        clearSwingWindow()
         return finalizedLabel
     }
 
     /**
-     * Feed one frame. Returns finalizedLabel (the last committed shot).
-     * Returns "" only if no shot has ever been finalized in this session.
+     * Feed one frame of keypoints.
      *
-     * The overlay should display finalizedLabel; "" means "no shot yet —
-     * show nothing", NOT "show Cut".
+     * Internally:
+     *  1. Updates BatMovementTracker to get current orientation + phase.
+     *  2. Computes wrist velocity.
+     *  3. Calls ShotClassifier with BOTH wrist velocity and bat angle.
+     *  4. Runs the state machine with phase-aware thresholds.
+     *
+     * Returns finalizedLabel (the last committed shot, or "" if none yet).
      */
     fun feed(keypoints: List<Keypoint>): String {
         val wristPos = getBestWristPos(keypoints) ?: return finalizedLabel
@@ -131,7 +146,12 @@ class ShotEventDetector {
             return finalizedLabel
         }
 
-        // Compute wrist velocity this frame
+        // ── 1. Bat orientation this frame ──────────────────────────────────
+        val batMovement   = batTracker.update(keypoints)
+        val batAngle      = batMovement.current        // BatAngleResult
+        val batPhase      = batMovement.swingPhase     // SwingPhase
+
+        // ── 2. Wrist velocity ──────────────────────────────────────────────
         val velocity = if (lastWristPos != null) {
             val dx = wristPos.first  - lastWristPos!!.first
             val dy = wristPos.second - lastWristPos!!.second
@@ -141,56 +161,90 @@ class ShotEventDetector {
 
         lastWristPos = wristPos
 
-        // Pass velocity into the classifier — it returns "" when wrist is still.
-        // This is what prevents the idle standing pose from showing as "Cut".
-        val frameLabel = ShotClassifier.classify(keypoints, velocity)
+        // ── 3. Per-frame label (pose + bat angle) ──────────────────────────
+        val frameLabel = ShotClassifier.classify(keypoints, velocity, batAngle)
 
         Log.d("SHOT_DETECTOR",
             "feed  state=$state  vel=${"%.4f".format(velocity)}  " +
+                    "batPhase=$batPhase  batOri=${batAngle.orientation}  " +
                     "label=${frameLabel.ifEmpty { "—" }}  peak=${"%.4f".format(maxVelocityInSwing)}")
 
+        // ── 4. Phase-aware entry threshold ────────────────────────────────
+        // During DOWNSWING the bat is already on its way — open the swing
+        // window at a lower velocity so we don't miss slow deliberate shots.
+        val swingStartThreshold = if (batPhase == SwingPhase.DOWNSWING)
+            VELOCITY_SWING_START_DOWN
+        else
+            VELOCITY_SWING_START
+
+        // ── 5. State machine ───────────────────────────────────────────────
         when (state) {
+
             State.IDLE -> {
-                if (velocity > VELOCITY_SWING_START) {
+                // Suppress SWINGING entry during BACKLIFT — wrist may be fast
+                // but the bat hasn't started coming down yet.
+                val inBacklift = (batPhase == SwingPhase.BACKLIFT)
+
+                if (velocity > swingStartThreshold && !inBacklift) {
                     state = State.SWINGING
                     swingLabels.clear()
                     swingVelocities.clear()
-                    swingFrameCount = 1
-                    maxVelocityInSwing = velocity
+                    swingBatPhases.clear()
+                    swingFrameCount      = 1
+                    maxVelocityInSwing   = velocity
+                    impactFrameLabel     = ""
+
                     if (frameLabel.isNotEmpty()) {
-                        swingLabels += frameLabel
+                        swingLabels    += frameLabel
                         swingVelocities += velocity
+                        swingBatPhases  += batPhase
                     }
                 }
-                // While IDLE, do NOT update finalizedLabel — keep the last real shot visible
+                // Do NOT update finalizedLabel while IDLE
             }
 
             State.SWINGING -> {
                 swingFrameCount++
                 maxVelocityInSwing = maxOf(maxVelocityInSwing, velocity)
+
                 if (frameLabel.isNotEmpty()) {
-                    swingLabels += frameLabel
+                    swingLabels    += frameLabel
                     swingVelocities += velocity
+                    swingBatPhases  += batPhase
                 }
-                if (velocity < VELOCITY_SETTLE_ENTER) {
-                    state = State.SETTLING
+
+                // Capture label at IMPACT_ZONE — this is the most reliable frame
+                if (batPhase == SwingPhase.IMPACT_ZONE && frameLabel.isNotEmpty()) {
+                    impactFrameLabel = frameLabel
+                }
+
+                // FOLLOW_THROUGH phase counts as settling immediately
+                if (batPhase == SwingPhase.FOLLOW_THROUGH || velocity < VELOCITY_SETTLE_ENTER) {
+                    state       = State.SETTLING
                     settleCount = 1
                 }
             }
 
             State.SETTLING -> {
                 if (frameLabel.isNotEmpty()) {
-                    swingLabels += frameLabel
+                    swingLabels    += frameLabel
                     swingVelocities += velocity
+                    swingBatPhases  += batPhase
                 }
-                if (velocity > VELOCITY_SWING_HOLD) {
+
+                if (velocity > VELOCITY_SWING_HOLD && batPhase != SwingPhase.FOLLOW_THROUGH) {
+                    // Genuine continuation of swing (not just follow-through wobble)
                     state = State.SWINGING
                     settleCount = 0
                     swingFrameCount++
                     maxVelocityInSwing = maxOf(maxVelocityInSwing, velocity)
                 } else {
                     settleCount++
-                    if (settleCount >= SETTLE_FRAMES) {
+                    // Settle faster when bat phase confirms shot is done
+                    val settleTarget = if (batPhase == SwingPhase.FOLLOW_THROUGH ||
+                        batPhase == SwingPhase.IDLE) 1
+                    else SETTLE_FRAMES
+                    if (settleCount >= settleTarget) {
                         tryFinalize()
                         clearSwingWindow()
                     }
@@ -221,51 +275,66 @@ class ShotEventDetector {
         shotHistory += label
         Log.d("SHOT_DETECTOR",
             "COMMITTED → $finalizedLabel  frames=$swingFrameCount  " +
-                    "peak=${"%.4f".format(maxVelocityInSwing)}  labels=$swingLabels")
+                    "peak=${"%.4f".format(maxVelocityInSwing)}  labels=$swingLabels  " +
+                    "impact=$impactFrameLabel")
     }
 
     /**
-     * Pick the best label from the current swing window:
-     *  1. Label at peak-velocity frame (impact moment)
-     *  2. Majority vote excluding "Defensive" (real shot dominates mid-swing)
-     *  3. Majority vote over everything
+     * Pick the best label from the current swing window using three signals
+     * in priority order:
+     *
+     *  1. impactFrameLabel — label captured exactly when bat was in IMPACT_ZONE.
+     *     This is the most geometrically accurate moment (bat meets ball).
+     *
+     *  2. Peak-velocity frame label — highest wrist speed = actual stroke.
+     *
+     *  3. Majority vote (non-Defensive preferred over Defensive).
      */
     private fun pickBestLabel(): String {
         if (swingLabels.isEmpty()) return ""
 
-        // 1. Peak-velocity frame
+        // 1. Impact-zone frame
+        if (impactFrameLabel.isNotEmpty() && impactFrameLabel != ShotClassifier.FRONT_FOOT_DEF) {
+            Log.d("SHOT_DETECTOR", "pickBest: impact-frame → $impactFrameLabel")
+            return impactFrameLabel
+        }
+
+        // 2. Peak-velocity frame
         if (swingVelocities.isNotEmpty()) {
             val maxVel  = swingVelocities.max()
             val peakIdx = swingVelocities.indexOfFirst { it == maxVel }
             val peak    = swingLabels.getOrNull(peakIdx) ?: ""
-            if (peak.isNotEmpty() && peak != "Defensive") {
+            if (peak.isNotEmpty() && peak != ShotClassifier.FRONT_FOOT_DEF) {
                 Log.d("SHOT_DETECTOR", "pickBest: peak-frame → $peak (v=${"%.4f".format(maxVel)})")
                 return peak
             }
         }
 
-        // 2. Majority vote (non-Defensive)
-        val nonDef = swingLabels.filter { it.isNotEmpty() && it != "Defensive" }
+        // 3. Majority vote — non-Defensive first
+        val nonDef = swingLabels.filter { it.isNotEmpty() && it != ShotClassifier.FRONT_FOOT_DEF }
         if (nonDef.isNotEmpty()) {
             val v = majorityVote(nonDef)
             Log.d("SHOT_DETECTOR", "pickBest: majority (non-def) → $v")
             return v
         }
 
-        // 3. Majority vote (all)
         val v = majorityVote(swingLabels.filter { it.isNotEmpty() })
         Log.d("SHOT_DETECTOR", "pickBest: majority (all) → $v")
         return v
     }
 
-    /** Clears the per-swing window but intentionally leaves finalizedLabel alone. */
+    /** Clear per-swing accumulators without touching finalizedLabel. */
     private fun clearSwingWindow() {
         state = State.IDLE
         swingLabels.clear()
         swingVelocities.clear()
-        settleCount = 0
-        swingFrameCount = 0
+        swingBatPhases.clear()
+        settleCount        = 0
+        swingFrameCount    = 0
         maxVelocityInSwing = 0f
+        impactFrameLabel   = ""
+        // NOTE: batTracker is NOT reset here — its angle history should carry
+        // over between shots so the first frame of the next swing has context.
     }
 
     private fun getBestWristPos(keypoints: List<Keypoint>): Pair<Float, Float>? {
@@ -279,7 +348,7 @@ class ShotEventDetector {
         }
         if (wr != null) return wr
 
-        // Fallback to elbows when wrists are occluded
+        // Fallback to elbows
         val le = keypoints.getOrNull(7)?.takeIf  { it.confidence >= CONF_THRESHOLD }
         val re = keypoints.getOrNull(8)?.takeIf  { it.confidence >= CONF_THRESHOLD }
         return when {
