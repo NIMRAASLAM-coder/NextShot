@@ -1,0 +1,54 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build iOS App
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      # FIX: This step finds the exact directory containing pubspec.yaml dynamically
+      - name: Locate Flutter Project Root
+        id: locate-root
+        run: |
+          FLUTTER_ROOT_DIR=$(find . -name "pubspec.yaml" -exec dirname {} \;)
+          echo "PROJECT_ROOT=$FLUTTER_ROOT_DIR" >> $GITHUB_ENV
+          echo "Found Flutter root folder at: $FLUTTER_ROOT_DIR"
+
+      # FIX: Runs command using the dynamic path discovered above
+      - name: Install Dependencies
+        run: |
+          cd ${{ env.PROJECT_ROOT }}
+          flutter pub get
+
+      # FIX: Builds IPA inside the discovered project path
+      - name: Build IPA
+        run: |
+          cd ${{ env.PROJECT_ROOT }}
+          flutter build ipa --no-codesign
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ios-app
+          path: |
+            **/build/ios/ipa/*.ipa
